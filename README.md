@@ -12,6 +12,7 @@ This library enables multi-manager field ownership tracking and conflict detecti
 - **Multi-manager ownership**: Track which manager owns which fields
 - **Conflict detection**: Detect and report conflicts when multiple managers modify the same fields
 - **Schema-based merging**: Type-aware merge operations using schema definitions
+- **OpenAPI support**: Parse OpenAPI v2 (Swagger) and v3 documents and convert to SMD schema
 - **Version conversion**: Support for converting objects between API versions
 - **Schema reconciliation**: Handle schema changes (granular to atomic, atomic to granular)
 - **Field path serialization**: Compatible serialization format with Go implementation
@@ -31,6 +32,7 @@ structured-merge-diff = "6.3.0"
 |--------|-------------|
 | `fieldpath` | Field path representation, serialization, and management for tracking field ownership |
 | `merge` | High-level multi-manager merge and apply operations with conflict detection |
+| `openapi` | Parse OpenAPI v2/v3 documents and convert to SMD schema |
 | `schema` | Type schema definition language for structured merge operations |
 | `typed` | Operations on Values with specific schemas (validation, comparison, merging) |
 | `value` | In-memory representation of YAML/JSON objects |
@@ -131,6 +133,105 @@ let result = updater.extract_apply(
     false,  // force
 ).unwrap();
 ```
+
+### Using OpenAPI Schema
+
+Convert OpenAPI v2 (Swagger) or v3 documents to SMD schema format:
+
+```rust
+use structured_merge_diff::openapi::{OpenAPIDocument, convert_openapi_to_schema};
+
+// Parse from JSON
+let json = r##"{
+    "swagger": "2.0",
+    "info": {"title": "My API", "version": "1.0"},
+    "definitions": {
+        "Pod": {
+            "type": "object",
+            "properties": {
+                "metadata": {"$ref": "#/definitions/ObjectMeta"},
+                "spec": {"$ref": "#/definitions/PodSpec"}
+            }
+        },
+        "PodSpec": {
+            "type": "object",
+            "properties": {
+                "containers": {
+                    "type": "array",
+                    "items": {"$ref": "#/definitions/Container"},
+                    "x-kubernetes-list-type": "map",
+                    "x-kubernetes-list-map-keys": ["name"]
+                }
+            }
+        },
+        "Container": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "image": {"type": "string"}
+            }
+        },
+        "ObjectMeta": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "labels": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "x-kubernetes-map-type": "granular"
+                }
+            }
+        }
+    }
+}"##;
+
+let doc = OpenAPIDocument::from_json(json).unwrap();
+let result = convert_openapi_to_schema(&doc);
+
+// Check for conversion errors
+for err in &result.errors {
+    eprintln!("Warning: {}", err);
+}
+
+// Use the converted schema
+let schema = result.schema;
+println!("Converted {} types", schema.types.len());
+```
+
+OpenAPI v3 documents are also supported:
+
+```rust
+let json = r#"{
+    "openapi": "3.0.0",
+    "info": {"title": "My API", "version": "1.0"},
+    "components": {
+        "schemas": {
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "x-kubernetes-list-type": "set"
+                    }
+                }
+            }
+        }
+    }
+}"#;
+
+let doc = OpenAPIDocument::from_json(json).unwrap();
+```
+
+The converter supports all Kubernetes OpenAPI extensions:
+- `x-kubernetes-list-type`: atomic, set, map
+- `x-kubernetes-list-map-keys`: keys for map-type lists
+- `x-kubernetes-map-type`: atomic, granular
+- `x-kubernetes-preserve-unknown-fields`: preserve unknown fields
+- `x-kubernetes-int-or-string`: field can be int or string
+- `x-kubernetes-embedded-resource`: embedded resource
+- `x-kubernetes-unions`: union discriminators
 
 ## API Reference
 
@@ -251,10 +352,11 @@ This implementation is compatible with Go structured-merge-diff v6.3.0. All test
 | multiple_appliers_test.go | 11 |
 | nested_test.go | 14 |
 | obsolete_versions_test.go | 3 |
+| openapi (new) | 8 |
 | preserve_unknown_test.go | 1 |
 | schema_change_test.go | 4 |
 | set_test.go | 10 |
-| **Total** | **277 tests** |
+| **Total** | **285 tests** |
 
 ## Development
 

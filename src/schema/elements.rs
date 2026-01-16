@@ -362,6 +362,22 @@ impl Map {
         }
     }
 
+    /// Creates a new Map with all fields specified.
+    pub fn with_all(
+        fields: Vec<StructField>,
+        element_type: TypeRef,
+        element_relationship: ElementRelationship,
+        unions: Vec<Union>,
+    ) -> Self {
+        Map {
+            fields,
+            unions,
+            element_type,
+            element_relationship,
+            field_map: OnceCell::new(),
+        }
+    }
+
     /// FindField returns the referenced StructField, if it exists.
     pub fn find_field(&self, name: &str) -> Option<&StructField> {
         let map = self.field_map.get_or_init(|| {

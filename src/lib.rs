@@ -13,9 +13,11 @@
 //! - [`fieldpath`] - Field path representation and management for tracking field ownership
 //! - [`typed`] - Operations on Values with specific schemas (validation, comparison, merging)
 //! - [`merge`] - High-level multi-manager merge and apply operations
+//! - [`openapi`] - OpenAPI v2/v3 to SMD schema conversion
 
 pub mod fieldpath;
 pub mod merge;
+pub mod openapi;
 pub mod schema;
 pub mod typed;
 pub mod value;
