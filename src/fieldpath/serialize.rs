@@ -146,7 +146,7 @@ fn serde_json_to_value(v: &serde_json::Value) -> Value {
                 Value::Null
             }
         }
-        serde_json::Value::String(s) => Value::String(s.clone().into()),
+        serde_json::Value::String(s) => Value::String(s.clone()),
         serde_json::Value::Array(arr) => {
             let items: Vec<Value> = arr.iter().map(serde_json_to_value).collect();
             Value::List(items)

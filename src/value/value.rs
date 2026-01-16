@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 /// Value represents a JSON/YAML value that can be any of the supported types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
+    #[default]
     Null,
     Bool(bool),
     Int(i64),
@@ -14,12 +15,6 @@ pub enum Value {
     String(String),
     List(Vec<Value>),
     Map(Map),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Value::Null
-    }
 }
 
 /// Map represents a key-value map where keys are strings.

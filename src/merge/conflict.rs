@@ -92,7 +92,7 @@ impl Conflicts {
 
         // Sort paths within each manager
         for paths in by_manager.values_mut() {
-            paths.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            paths.sort_by_key(|p| p.to_string());
         }
 
         // Build output

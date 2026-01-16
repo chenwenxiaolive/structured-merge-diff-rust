@@ -394,7 +394,7 @@ impl TypedValue {
         let field = map_schema.find_field(field_name)?;
 
         // Return the default value if it exists, converting from serde_json::Value to our Value
-        field.default.as_ref().map(|default| json_value_to_value(default))
+        field.default.as_ref().map(json_value_to_value)
     }
 
     /// Converts the typed value to a field set representing all leaf paths.
@@ -411,6 +411,7 @@ impl TypedValue {
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn collect_field_set(
         &self,
         value: &Value,
@@ -518,10 +519,8 @@ impl TypedValue {
             }
             _ => {
                 // Scalar values (String, Int, Float, Bool, Null)
-                if atom.scalar.is_some() {
-                    if !path.is_empty() {
-                        set.insert(&path);
-                    }
+                if atom.scalar.is_some() && !path.is_empty() {
+                    set.insert(&path);
                 }
             }
         }
@@ -732,7 +731,7 @@ impl TypedValue {
         }
 
         // Find removed items (in lhs but not rhs)
-        for (pe, _) in &lhs_by_key {
+        for pe in lhs_by_key.keys() {
             if !rhs_by_key.contains_key(pe) {
                 comparison.removed.insert(&path.with(pe.clone()));
             }
@@ -1095,7 +1094,7 @@ impl TypedValue {
             for item in lhs {
                 if let Ok(key) = self.list_item_to_key(item, list) {
                     lhs_key_set.insert(key.clone());
-                    lhs_by_key.entry(key).or_insert_with(Vec::new).push(item.clone());
+                    lhs_by_key.entry(key).or_default().push(item.clone());
                 }
             }
 
@@ -1113,7 +1112,7 @@ impl TypedValue {
             let rhs_subset_of_lhs = rhs_key_set.iter().all(|k| lhs_key_set.contains(k));
             let lhs_subset_of_rhs = lhs_key_set.iter().all(|k| rhs_key_set.contains(k));
             let lhs_has_rhs_duplicates = rhs_key_set.iter().any(|k| {
-                lhs_by_key.get(k).map_or(false, |v| v.len() > 1)
+                lhs_by_key.get(k).is_some_and(|v| v.len() > 1)
             });
             let rhs_is_proper_subset = rhs_subset_of_lhs && !lhs_subset_of_rhs;
 

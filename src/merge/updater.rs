@@ -185,7 +185,7 @@ impl Updater {
     ) -> Result<Comparison, ApplyError> {
         // Compare old and new objects
         let compare = old_object.compare(new_object)
-            .map_err(|e| ApplyError::ValidationError(e))?;
+            .map_err(ApplyError::ValidationError)?;
 
         // Apply ignored fields filter if configured
         let filtered_compare = if let Some(fields) = self.ignored_fields.get(version) {
@@ -238,7 +238,7 @@ impl Updater {
                 };
 
                 versioned_old.compare(&versioned_new)
-                    .map_err(|e| ApplyError::ValidationError(e))?
+                    .map_err(ApplyError::ValidationError)?
             } else {
                 filtered_compare.clone()
             };
@@ -315,11 +315,11 @@ impl Updater {
     ) -> Result<TypedValue, ApplyError> {
         // Merge config into live object
         let new_object = live_obj.merge(config_obj)
-            .map_err(|e| ApplyError::ValidationError(e))?;
+            .map_err(ApplyError::ValidationError)?;
 
         // Get the field set from the config
         let config_set = config_obj.to_field_set()
-            .map_err(|e| ApplyError::ValidationError(e))?;
+            .map_err(ApplyError::ValidationError)?;
 
         // Apply ignored fields filter
         let filtered_set = if let Some(fields) = self.ignored_fields.get(version) {
@@ -369,11 +369,11 @@ impl Updater {
 
         // Merge config into live object
         let new_object = live_obj.merge(config_obj)
-            .map_err(|e| ApplyError::ValidationError(e))?;
+            .map_err(ApplyError::ValidationError)?;
 
         // Get the field set from the config
         let config_set = config_obj.to_field_set()
-            .map_err(|e| ApplyError::ValidationError(e))?;
+            .map_err(ApplyError::ValidationError)?;
 
         // Apply ignored fields filter
         let filtered_set = if let Some(fields) = self.ignored_fields.get(version) {
@@ -501,7 +501,7 @@ impl Updater {
         // Get or create manager entry
         let current_set = managers.get(manager)
             .map(|vs| vs.set().clone())
-            .unwrap_or_else(Set::new);
+            .unwrap_or_default();
 
         // Update manager's field set:
         // - Remove fields that were removed

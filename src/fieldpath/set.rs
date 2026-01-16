@@ -237,7 +237,7 @@ impl Set {
             return;
         }
 
-        let child = self.children.entry(first.clone()).or_insert_with(Set::new);
+        let child = self.children.entry(first.clone()).or_default();
         child.insert_path_elements(rest);
     }
 

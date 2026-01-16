@@ -115,7 +115,7 @@ pub enum Scalar {
 
 /// ElementRelationship is an enum of the different possible relationships
 /// between the elements of container types (maps, lists).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ElementRelationship {
     /// Associative only applies to lists (see the documentation there).
@@ -124,13 +124,8 @@ pub enum ElementRelationship {
     Atomic,
     /// Separable means the items of the container type have no particular
     /// relationship (default behavior for maps).
+    #[default]
     Separable,
-}
-
-impl Default for ElementRelationship {
-    fn default() -> Self {
-        ElementRelationship::Separable
-    }
 }
 
 /// Map is a key-value pair. Its default semantics are the same as an
