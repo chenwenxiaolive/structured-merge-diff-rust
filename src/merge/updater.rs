@@ -117,6 +117,62 @@ impl Updater {
         UpdaterBuilder::new()
     }
 
+    /// Reconciles managed fields with any changes to the object's schema.
+    ///
+    /// Supports:
+    /// - Changing types from atomic to granular
+    /// - Changing types from granular to atomic
+    fn reconcile_managed_fields_with_schema_changes(
+        &self,
+        live_object: &TypedValue,
+        managers: &mut ManagedFields,
+    ) -> Result<(), ApplyError> {
+        use crate::typed::reconcile_field_set_with_schema;
+
+        let mut updated_entries: Vec<(String, VersionedSet)> = Vec::new();
+
+        for (manager, versioned_set) in managers.iter() {
+            // Convert to the manager's version if needed
+            let tv = if let Some(ref converter) = self.converter {
+                match converter.convert(live_object, versioned_set.api_version()) {
+                    Ok(v) => v,
+                    Err(e) if converter.is_missing_version_error(&e) => {
+                        // Okay to skip, obsolete versions will be deleted automatically anyway
+                        continue;
+                    }
+                    Err(e) => return Err(ApplyError::ConversionError(e)),
+                }
+            } else {
+                live_object.clone()
+            };
+
+            // Reconcile the field set with the schema
+            match reconcile_field_set_with_schema(versioned_set.set(), &tv) {
+                Ok(Some(reconciled)) => {
+                    updated_entries.push((
+                        manager.clone(),
+                        VersionedSet::new(reconciled, versioned_set.api_version().clone(), versioned_set.applied()),
+                    ));
+                }
+                Ok(None) => {
+                    // No changes needed
+                }
+                Err(e) => {
+                    return Err(ApplyError::ValidationError(ValidationErrors::from_error(
+                        crate::typed::ValidationError::schema_error(&e),
+                    )));
+                }
+            }
+        }
+
+        // Apply updates
+        for (manager, vs) in updated_entries {
+            managers.insert(manager, vs);
+        }
+
+        Ok(())
+    }
+
     /// Internal update logic that computes conflicts and field changes.
     fn update_internal(
         &self,
@@ -149,6 +205,7 @@ impl Updater {
         // Track conflicts and removals
         let mut conflicts = Conflicts::new();
         let mut removed_by_manager: HashMap<String, Set> = HashMap::new();
+        let mut obsolete_managers: Vec<String> = Vec::new();
 
         // Check each manager for conflicts
         for (manager, versioned_set) in managers.iter() {
@@ -163,12 +220,20 @@ impl Updater {
                 // Convert objects to manager's version for comparison
                 let versioned_old = match converter.convert(old_object, versioned_set.api_version()) {
                     Ok(v) => v,
-                    Err(e) if converter.is_missing_version_error(&e) => continue,
+                    Err(e) if converter.is_missing_version_error(&e) => {
+                        // Mark this manager as having an obsolete version
+                        obsolete_managers.push(manager.clone());
+                        continue;
+                    },
                     Err(e) => return Err(ApplyError::ConversionError(e)),
                 };
                 let versioned_new = match converter.convert(new_object, versioned_set.api_version()) {
                     Ok(v) => v,
-                    Err(e) if converter.is_missing_version_error(&e) => continue,
+                    Err(e) if converter.is_missing_version_error(&e) => {
+                        // Mark this manager as having an obsolete version
+                        obsolete_managers.push(manager.clone());
+                        continue;
+                    },
                     Err(e) => return Err(ApplyError::ConversionError(e)),
                 };
 
@@ -201,6 +266,11 @@ impl Updater {
             return Err(ApplyError::Conflicts(conflicts));
         }
 
+        // Remove managers with obsolete versions
+        for manager in obsolete_managers {
+            managers.remove(&manager);
+        }
+
         // Remove conflicting fields from other managers
         for conflict in conflicts.iter() {
             if let Some(vs) = managers.get(&conflict.manager) {
@@ -229,10 +299,12 @@ impl Updater {
         Ok(compare)
     }
 
-    /// Apply performs an apply operation.
+    /// ExtractApply performs an extract-apply operation.
     ///
-    /// This merges the config object into the live object, tracking field ownership.
-    pub fn apply(
+    /// This is like apply but additive - it doesn't remove fields that the manager
+    /// previously owned but are not in the current config. It adds the new fields
+    /// to the manager's ownership while keeping the old ones.
+    pub fn extract_apply(
         &self,
         live_obj: &TypedValue,
         config_obj: &TypedValue,
@@ -251,43 +323,120 @@ impl Updater {
 
         // Apply ignored fields filter
         let filtered_set = if let Some(fields) = self.ignored_fields.get(version) {
-            config_set.difference(fields)
+            config_set.recursive_difference(fields)
         } else if let Some(filter) = self.ignore_filter.get(version) {
             filter.filter(&config_set)
         } else {
             config_set
         };
 
-        // Store the previous set for this manager (for pruning)
-        let last_set = managers.get(manager).cloned();
+        // Get the previous set for this manager (for union, not pruning)
+        let last_set = managers.get(manager).map(|vs| vs.set().clone());
+
+        // For extract_apply, we UNION with the previous set instead of replacing
+        let new_manager_set = if let Some(ls) = last_set {
+            ls.union(&filtered_set)
+        } else {
+            filtered_set
+        };
 
         // Update manager's field set
+        managers.insert(
+            manager.to_string(),
+            VersionedSet::new(new_manager_set, version.clone(), false),
+        );
+
+        // Run update to check for conflicts with other managers
+        self.update_internal(live_obj, &new_object, version, managers, manager, force)?;
+
+        Ok(new_object)
+    }
+
+    /// Apply performs an apply operation.
+    ///
+    /// This merges the config object into the live object, tracking field ownership.
+    pub fn apply(
+        &self,
+        live_obj: &TypedValue,
+        config_obj: &TypedValue,
+        version: &APIVersion,
+        managers: &mut ManagedFields,
+        manager: &str,
+        force: bool,
+    ) -> Result<TypedValue, ApplyError> {
+        // Reconcile managed fields with any schema changes
+        self.reconcile_managed_fields_with_schema_changes(live_obj, managers)?;
+
+        // Merge config into live object
+        let new_object = live_obj.merge(config_obj)
+            .map_err(|e| ApplyError::ValidationError(e))?;
+
+        // Get the field set from the config
+        let config_set = config_obj.to_field_set()
+            .map_err(|e| ApplyError::ValidationError(e))?;
+
+        // Apply ignored fields filter
+        let filtered_set = if let Some(fields) = self.ignored_fields.get(version) {
+            config_set.recursive_difference(fields)
+        } else if let Some(filter) = self.ignore_filter.get(version) {
+            filter.filter(&config_set)
+        } else {
+            config_set
+        };
+
+        // Store the previous set for this manager (for pruning and rollback)
+        let last_set = managers.get(manager).cloned();
+
+        // Check if the previous version is obsolete (can't be converted)
+        let prev_version_obsolete = if let Some(ref ls) = last_set {
+            if ls.api_version() == version {
+                false
+            } else if let Some(ref converter) = self.converter {
+                // Try to convert to the old version to see if it's still valid
+                match converter.convert(live_obj, ls.api_version()) {
+                    Ok(_) => false,
+                    Err(e) if converter.is_missing_version_error(&e) => true,
+                    Err(_) => false, // Other errors don't indicate obsolete version
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Temporarily update manager's field set (needed for pruning logic)
         managers.insert(
             manager.to_string(),
             VersionedSet::new(filtered_set.clone(), version.clone(), true),
         );
 
         // Prune fields that were removed from the config
-        let pruned_object = if let Some(ref ls) = last_set {
-            if !ls.set().is_empty() {
-                let removed_from_config = ls.set().difference(&filtered_set);
-                if !removed_from_config.is_empty() {
-                    // Remove fields that this manager owned but no longer does
-                    // unless another manager owns them
-                    let mut to_remove = Set::new();
-                    removed_from_config.iterate(|path| {
-                        let mut owned_by_other = false;
-                        for (other_manager, other_vs) in managers.iter() {
-                            if other_manager != manager && other_vs.set().has(path) {
-                                owned_by_other = true;
-                                break;
+        // Skip pruning if the previous version is obsolete (we can't determine what was previously owned)
+        let pruned_object = if !prev_version_obsolete {
+            if let Some(ref ls) = last_set {
+                if !ls.set().is_empty() {
+                    let removed_from_config = ls.set().difference(&filtered_set);
+                    if !removed_from_config.is_empty() {
+                        // Remove fields that this manager owned but no longer does
+                        // unless another manager owns them
+                        let mut to_remove = Set::new();
+                        removed_from_config.iterate(|path| {
+                            let mut owned_by_other = false;
+                            for (other_manager, other_vs) in managers.iter() {
+                                if other_manager != manager && other_vs.set().has(path) {
+                                    owned_by_other = true;
+                                    break;
+                                }
                             }
-                        }
-                        if !owned_by_other {
-                            to_remove.insert(path);
-                        }
-                    });
-                    new_object.remove_items(&to_remove)
+                            if !owned_by_other {
+                                to_remove.insert(path);
+                            }
+                        });
+                        new_object.remove_items(&to_remove)
+                    } else {
+                        new_object
+                    }
                 } else {
                     new_object
                 }
@@ -299,7 +448,18 @@ impl Updater {
         };
 
         // Run update to check for conflicts with other managers
-        self.update_internal(live_obj, &pruned_object, version, managers, manager, force)?;
+        let result = self.update_internal(live_obj, &pruned_object, version, managers, manager, force);
+
+        // If there's a conflict, roll back the manager entry
+        if result.is_err() {
+            // Restore the previous state
+            if let Some(ls) = last_set {
+                managers.insert(manager.to_string(), ls);
+            } else {
+                managers.remove(manager);
+            }
+            return result.map(|_| pruned_object);
+        }
 
         // Check for no-op
         if !self.return_input_on_noop && live_obj.value() == pruned_object.value() {
@@ -320,6 +480,15 @@ impl Updater {
         managers: &mut ManagedFields,
         manager: &str,
     ) -> Result<TypedValue, UpdateError> {
+        // Reconcile managed fields with any schema changes
+        self.reconcile_managed_fields_with_schema_changes(live_obj, managers)
+            .map_err(|e| match e {
+                ApplyError::Conflicts(c) => UpdateError::Conflicts(c),
+                ApplyError::ConversionError(e) => UpdateError::ConversionError(e),
+                ApplyError::ValidationError(e) => UpdateError::ValidationError(e),
+                ApplyError::NotImplemented => UpdateError::NotImplemented,
+            })?;
+
         // Run update with force=true (updates don't conflict)
         let compare = self.update_internal(live_obj, new_obj, version, managers, manager, true)
             .map_err(|e| match e {
@@ -344,7 +513,7 @@ impl Updater {
 
         // Apply ignored fields filter
         let filtered_set = if let Some(fields) = self.ignored_fields.get(version) {
-            new_set.difference(fields)
+            new_set.recursive_difference(fields)
         } else if let Some(filter) = self.ignore_filter.get(version) {
             filter.filter(&new_set)
         } else {

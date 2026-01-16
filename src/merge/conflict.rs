@@ -1,6 +1,7 @@
 //! Conflict types for merge operations.
 
 use crate::fieldpath::{ManagedFields, Path, Set};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Conflict represents a single field conflict.
@@ -72,6 +73,41 @@ impl Conflicts {
         }
         set
     }
+
+    /// Returns the error message in Go-compatible format.
+    /// Groups conflicts by manager, sorted alphabetically.
+    pub fn error(&self) -> String {
+        if self.conflicts.is_empty() {
+            return String::new();
+        }
+
+        // Group by manager, using BTreeMap for sorted order
+        let mut by_manager: BTreeMap<&str, Vec<&Path>> = BTreeMap::new();
+        for conflict in &self.conflicts {
+            by_manager
+                .entry(&conflict.manager)
+                .or_default()
+                .push(&conflict.path);
+        }
+
+        // Sort paths within each manager
+        for paths in by_manager.values_mut() {
+            paths.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        }
+
+        // Build output
+        let mut result = String::new();
+        for (i, (manager, paths)) in by_manager.iter().enumerate() {
+            if i > 0 {
+                result.push('\n');
+            }
+            result.push_str(&format!("conflicts with \"{}\":", manager));
+            for path in paths {
+                result.push_str(&format!("\n- {}", path));
+            }
+        }
+        result
+    }
 }
 
 impl IntoIterator for Conflicts {
@@ -85,28 +121,55 @@ impl IntoIterator for Conflicts {
 
 impl fmt::Display for Conflicts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, conflict) in self.conflicts.iter().enumerate() {
-            if i > 0 {
-                writeln!(f)?;
-            }
-            write!(f, "{}", conflict)?;
-        }
-        Ok(())
+        write!(f, "{}", self.error())
     }
 }
 
 impl std::error::Error for Conflicts {}
 
 /// Extracts conflicts from ManagedFields.
-pub fn conflicts_from_managers(_managers: &ManagedFields) -> Conflicts {
-    // TODO: Implement conflict detection
-    Conflicts::new()
+/// Creates a Conflict entry for each path owned by each manager.
+pub fn conflicts_from_managers(managers: &ManagedFields) -> Conflicts {
+    let mut conflicts = Conflicts::new();
+
+    for (manager, vs) in managers.iter() {
+        vs.set().iterate(|path| {
+            conflicts.add(Conflict::new(manager.clone(), path.clone()));
+        });
+    }
+
+    conflicts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fieldpath::PathElement;
+    use crate::fieldpath::{PathElement, VersionedSet, APIVersion};
+    use crate::value::{Field, FieldList, Value};
+
+    fn key_by_fields(fields: Vec<(&str, Value)>) -> PathElement {
+        PathElement::Key(FieldList {
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| Field {
+                    name: name.to_string(),
+                    value,
+                })
+                .collect(),
+        })
+    }
+
+    fn make_path(elements: Vec<PathElement>) -> Path {
+        Path::from_elements(elements)
+    }
+
+    fn new_set(paths: Vec<Path>) -> Set {
+        let mut set = Set::new();
+        for path in paths {
+            set.insert(&path);
+        }
+        set
+    }
 
     #[test]
     fn test_conflict_display() {
@@ -125,5 +188,120 @@ mod tests {
         conflicts.add(Conflict::new("m1", Path::new()));
         assert!(!conflicts.is_empty());
         assert_eq!(conflicts.len(), 1);
+    }
+
+    // Test from Go: TestNewFromSets
+    #[test]
+    fn test_new_from_sets() {
+        let mut managers = ManagedFields::new();
+
+        let bob_set = new_set(vec![
+            make_path(vec![PathElement::field_name("key")]),
+            make_path(vec![
+                PathElement::field_name("list"),
+                key_by_fields(vec![("key", Value::String("a".to_string())), ("id", Value::Int(2))]),
+                PathElement::field_name("id"),
+            ]),
+        ]);
+        managers.insert("Bob", VersionedSet::new(bob_set, APIVersion::new("v1"), false));
+
+        let alice_set = new_set(vec![
+            make_path(vec![PathElement::field_name("value")]),
+            make_path(vec![
+                PathElement::field_name("list"),
+                key_by_fields(vec![("key", Value::String("a".to_string())), ("id", Value::Int(2))]),
+                PathElement::field_name("key"),
+            ]),
+        ]);
+        managers.insert("Alice", VersionedSet::new(alice_set, APIVersion::new("v1"), false));
+
+        let got = conflicts_from_managers(&managers);
+        let wanted = r#"conflicts with "Alice":
+- .list[id=2,key="a"].key
+- .value
+conflicts with "Bob":
+- .key
+- .list[id=2,key="a"].id"#;
+
+        assert_eq!(got.error(), wanted, "Got:\n{}\nWanted:\n{}", got.error(), wanted);
+    }
+
+    // Test from Go: TestToSet
+    #[test]
+    fn test_to_set() {
+        let mut managers = ManagedFields::new();
+
+        let bob_set = new_set(vec![
+            make_path(vec![PathElement::field_name("key")]),
+            make_path(vec![
+                PathElement::field_name("list"),
+                key_by_fields(vec![("key", Value::String("a".to_string())), ("id", Value::Int(2))]),
+                PathElement::field_name("id"),
+            ]),
+        ]);
+        managers.insert("Bob", VersionedSet::new(bob_set, APIVersion::new("v1"), false));
+
+        let alice_set = new_set(vec![
+            make_path(vec![PathElement::field_name("value")]),
+            make_path(vec![
+                PathElement::field_name("list"),
+                key_by_fields(vec![("key", Value::String("a".to_string())), ("id", Value::Int(2))]),
+                PathElement::field_name("key"),
+            ]),
+        ]);
+        managers.insert("Alice", VersionedSet::new(alice_set, APIVersion::new("v1"), false));
+
+        let conflicts = conflicts_from_managers(&managers);
+        let actual = conflicts.to_set();
+
+        let expected = new_set(vec![
+            make_path(vec![PathElement::field_name("key")]),
+            make_path(vec![PathElement::field_name("value")]),
+            make_path(vec![
+                PathElement::field_name("list"),
+                key_by_fields(vec![("key", Value::String("a".to_string())), ("id", Value::Int(2))]),
+                PathElement::field_name("id"),
+            ]),
+            make_path(vec![
+                PathElement::field_name("list"),
+                key_by_fields(vec![("key", Value::String("a".to_string())), ("id", Value::Int(2))]),
+                PathElement::field_name("key"),
+            ]),
+        ]);
+
+        assert!(expected.equals(&actual), "Expected:\n{:?}\nActual:\n{:?}", expected, actual);
+    }
+
+    // Test from Go: TestConflictsFromManagers
+    #[test]
+    fn test_conflicts_from_managers() {
+        let mut managers = ManagedFields::new();
+
+        let bob_set = new_set(vec![
+            make_path(vec![
+                PathElement::field_name("obj"),
+                PathElement::field_name("template"),
+                PathElement::field_name("obj"),
+                PathElement::field_name("list"),
+                key_by_fields(vec![("name", Value::String("a".to_string()))]),
+                PathElement::field_name("id"),
+            ]),
+            make_path(vec![
+                PathElement::field_name("obj"),
+                PathElement::field_name("template"),
+                PathElement::field_name("obj"),
+                PathElement::field_name("list"),
+                key_by_fields(vec![("name", Value::String("a".to_string()))]),
+                PathElement::field_name("key"),
+            ]),
+        ]);
+        managers.insert("Bob", VersionedSet::new(bob_set, APIVersion::new("v1"), false));
+
+        let got = conflicts_from_managers(&managers);
+        let wanted = r#"conflicts with "Bob":
+- .obj.template.obj.list[name="a"].id
+- .obj.template.obj.list[name="a"].key"#;
+
+        assert_eq!(got.error(), wanted, "Got:\n{}\nWanted:\n{}", got.error(), wanted);
     }
 }

@@ -190,17 +190,33 @@ impl std::fmt::Display for PathElement {
             PathElement::FieldName(name) => write!(f, ".{}", name),
             PathElement::Key(fields) => {
                 write!(f, "[")?;
-                for (i, field) in fields.fields.iter().enumerate() {
+                // Sort fields by name for consistent output
+                let mut sorted_fields: Vec<_> = fields.fields.iter().collect();
+                sorted_fields.sort_by_key(|field| &field.name);
+                for (i, field) in sorted_fields.iter().enumerate() {
                     if i > 0 {
                         write!(f, ",")?;
                     }
-                    write!(f, "{}={:?}", field.name, field.value)?;
+                    write!(f, "{}={}", field.name, format_value(&field.value))?;
                 }
                 write!(f, "]")
             }
-            PathElement::Value(v) => write!(f, "[={:?}]", v),
+            PathElement::Value(v) => write!(f, "[={}]", format_value(v)),
             PathElement::Index(i) => write!(f, "[{}]", i),
         }
+    }
+}
+
+/// Formats a Value for path display (Go-compatible format).
+fn format_value(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => format!("\"{}\"", s),
+        Value::List(_) => "[...]".to_string(),
+        Value::Map(_) => "{...}".to_string(),
     }
 }
 

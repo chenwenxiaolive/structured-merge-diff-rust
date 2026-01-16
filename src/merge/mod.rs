@@ -5,5 +5,8 @@
 mod updater;
 mod conflict;
 
+#[cfg(test)]
+mod merge_test;
+
 pub use updater::*;
 pub use conflict::*;

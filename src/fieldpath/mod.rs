@@ -4,10 +4,12 @@
 
 mod path;
 mod pathelementmap;
+mod serialize;
 mod set;
 
 pub use path::*;
 pub use pathelementmap::*;
+pub use serialize::*;
 pub use set::*;
 
 use std::collections::HashMap;

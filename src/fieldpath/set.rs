@@ -330,6 +330,75 @@ impl Set {
             current_path.pop();
         }
     }
+
+    /// Recursively removes a path and all its descendants from the set.
+    /// This is different from regular difference - it removes entire subtrees.
+    pub fn recursive_difference(&self, other: &Set) -> Set {
+        let mut result = self.clone();
+        result.recursive_difference_into(other);
+        result
+    }
+
+    fn recursive_difference_into(&mut self, other: &Set) {
+        // If other has root, remove everything
+        if other.root_in_set {
+            self.root_in_set = false;
+            self.members = PathElementSet::new();
+            self.children.clear();
+            return;
+        }
+
+        // For each member in other, remove from self.members AND self.children
+        // (because members in "to_remove" means "remove this path and all below")
+        for member in other.members.iter() {
+            self.members.remove(member);
+            self.children.remove(member);
+        }
+
+        // Recursively process children that exist in both
+        let children_to_process: Vec<_> = other.children.keys().cloned().collect();
+        for key in children_to_process {
+            if let Some(self_child) = self.children.get_mut(&key) {
+                if let Some(other_child) = other.children.get(&key) {
+                    self_child.recursive_difference_into(other_child);
+                    // Clean up empty children
+                    if self_child.is_empty() {
+                        self.children.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iterates over member PathElements.
+    pub fn members_iterate<F>(&self, mut f: F)
+    where
+        F: FnMut(&PathElement),
+    {
+        for member in self.members.iter() {
+            f(member);
+        }
+    }
+
+    /// Iterates over child PathElements.
+    pub fn children_iterate<F>(&self, mut f: F)
+    where
+        F: FnMut(&PathElement),
+    {
+        for key in self.children.keys() {
+            f(key);
+        }
+    }
+
+    /// Gets a child Set by PathElement.
+    pub fn children_get(&self, pe: &PathElement) -> Option<&Set> {
+        self.children.get(pe)
+    }
+
+    /// Returns true if the member set contains the given PathElement.
+    pub fn members_has(&self, pe: &PathElement) -> bool {
+        self.members.contains(pe)
+    }
 }
 
 #[cfg(test)]

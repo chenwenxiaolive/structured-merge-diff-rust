@@ -2,9 +2,37 @@
 
 use crate::fieldpath::{Path, PathElement, Set};
 use crate::schema::{ElementRelationship, Schema, Scalar, TypeRef};
-use crate::value::{Field, FieldList, Value};
+use crate::value::{Field, FieldList, Map, Value};
 use super::comparison::Comparison;
 use super::validation::{ValidationError, ValidationErrors, ValidationOption};
+
+/// Converts a serde_json::Value to our Value type.
+fn json_value_to_value(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            Value::List(arr.iter().map(json_value_to_value).collect())
+        }
+        serde_json::Value::Object(obj) => {
+            let mut map = Map::new();
+            for (k, v) in obj {
+                map.set(k.clone(), json_value_to_value(v));
+            }
+            Value::Map(map)
+        }
+    }
+}
 
 /// TypedValue is a Value paired with its schema and type.
 #[derive(Debug, Clone)]
@@ -111,13 +139,46 @@ impl TypedValue {
             }
         };
 
-        // Validate based on the atom type
-        if let Some(ref scalar) = atom.scalar {
-            self.validate_scalar(value, scalar, &path, errors);
-        } else if let Some(ref list) = atom.list {
-            self.validate_list(value, list, path, allow_duplicates, errors);
-        } else if let Some(ref map) = atom.map {
-            self.validate_map(value, map, path, allow_duplicates, errors);
+        // Validate based on the value type AND the available schema types
+        // This handles union types where an atom can have scalar, list, and map all defined
+        match value {
+            Value::Null => {
+                // null is always valid
+            }
+            Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => {
+                if let Some(ref scalar) = atom.scalar {
+                    self.validate_scalar(value, scalar, &path, errors);
+                } else {
+                    // No scalar type defined, try to see if it fits list or map
+                    errors.add(ValidationError::type_mismatch(
+                        format!("{}", path),
+                        if atom.list.is_some() { "list" } else if atom.map.is_some() { "map" } else { "unknown" },
+                        value_type_name(value),
+                    ));
+                }
+            }
+            Value::List(_) => {
+                if let Some(ref list) = atom.list {
+                    self.validate_list(value, list, path, allow_duplicates, errors);
+                } else {
+                    errors.add(ValidationError::type_mismatch(
+                        format!("{}", path),
+                        if atom.scalar.is_some() { "scalar" } else if atom.map.is_some() { "map" } else { "unknown" },
+                        "list",
+                    ));
+                }
+            }
+            Value::Map(_) => {
+                if let Some(ref map) = atom.map {
+                    self.validate_map(value, map, path, allow_duplicates, errors);
+                } else {
+                    errors.add(ValidationError::type_mismatch(
+                        format!("{}", path),
+                        if atom.scalar.is_some() { "scalar" } else if atom.list.is_some() { "list" } else { "unknown" },
+                        "map",
+                    ));
+                }
+            }
         }
     }
 
@@ -295,12 +356,45 @@ impl TypedValue {
                     });
                 }
                 None => {
-                    return Err(ValidationError::missing_field("", key_name.clone()));
+                    // Try to get default value from schema
+                    if let Some(default_val) = self.get_associative_key_default(list, key_name) {
+                        fields.push(Field {
+                            name: key_name.clone(),
+                            value: default_val,
+                        });
+                    }
+                    // If no default, don't add this key to the list
+                    // This allows partial keys where only some key fields have defaults
                 }
             }
         }
 
+        // If we have keys defined but couldn't find any key values (even with defaults),
+        // that's an error
+        if !list.keys.is_empty() && fields.is_empty() {
+            return Err(ValidationError::invalid_value(
+                "",
+                format!(
+                    "associative list with keys has an element that omits all key fields {:?} (and doesn't have default values for any key fields)",
+                    list.keys
+                ),
+            ));
+        }
+
         Ok(FieldList::with_fields(fields))
+    }
+
+    /// Gets the default value for an associative list key field from the schema.
+    fn get_associative_key_default(&self, list: &crate::schema::List, field_name: &str) -> Option<Value> {
+        // Resolve the list's element type to get the map schema
+        let atom = self.schema.resolve(&list.element_type)?;
+        let map_schema = atom.map.as_ref()?;
+
+        // Find the field in the map schema
+        let field = map_schema.find_field(field_name)?;
+
+        // Return the default value if it exists, converting from serde_json::Value to our Value
+        field.default.as_ref().map(|default| json_value_to_value(default))
     }
 
     /// Converts the typed value to a field set representing all leaf paths.
@@ -330,49 +424,104 @@ impl TypedValue {
             None => return,
         };
 
-        if let Some(_) = atom.scalar {
-            // Scalars are leaf nodes
-            if !path.is_empty() {
-                set.insert(&path);
-            }
-        } else if let Some(ref list) = atom.list {
-            if list.element_relationship == ElementRelationship::Atomic {
-                // Atomic lists are leaves
+        // Check value type first to handle "sum types" like deduced schema
+        // which have scalar, list, AND map all defined
+        match value {
+            Value::Null => {
+                // Null values are leaves - insert the path regardless of schema type
                 if !path.is_empty() {
                     set.insert(&path);
                 }
-            } else if let Value::List(items) = value {
-                for (i, item) in items.iter().enumerate() {
-                    let pe = if list.element_relationship == ElementRelationship::Associative {
-                        match self.list_item_to_key(item, list) {
-                            Ok(key) => PathElement::Key(key),
-                            Err(_) => PathElement::index(i as i32),
+            }
+            Value::Map(fields) => {
+                if let Some(ref map) = atom.map {
+                    if map.element_relationship == ElementRelationship::Atomic {
+                        // Atomic maps are leaves
+                        if !path.is_empty() {
+                            set.insert(&path);
                         }
                     } else {
-                        PathElement::index(i as i32)
-                    };
-                    let item_path = path.with(pe);
-                    self.collect_field_set(item, &list.element_type, item_path, set, errors);
+                        // Non-atomic maps: recurse into fields
+                        // For sum types (deduced schema), also insert the map path itself
+                        // A sum type has both scalar and map defined
+                        let is_sum_type = atom.scalar.is_some();
+                        let is_associative = map.element_relationship == ElementRelationship::Associative;
+                        if is_sum_type && !path.is_empty() {
+                            set.insert(&path);
+                        } else if fields.is_empty() && !path.is_empty() {
+                            // For regular schemas, only insert if empty (shouldn't happen normally)
+                            set.insert(&path);
+                        }
+                        for (key, val) in fields.iter() {
+                            let pe = PathElement::field_name(key.clone());
+                            let field_path = path.with(pe);
+
+                            let field_type = if let Some(field) = map.find_field(key) {
+                                field.field_type.clone()
+                            } else {
+                                map.element_type.clone()
+                            };
+
+                            self.collect_field_set(val, &field_type, field_path.clone(), set, errors);
+
+                            // For associative maps with element_type (not explicit fields),
+                            // insert each key's path similar to how we handle associative lists
+                            if is_associative && map.fields.is_empty() && map.element_type.named_type.is_some() {
+                                set.insert(&field_path);
+                            }
+                        }
+                    }
+                } else if atom.scalar.is_some() {
+                    // Fallback to scalar treatment
+                    if !path.is_empty() {
+                        set.insert(&path);
+                    }
                 }
             }
-        } else if let Some(ref map) = atom.map {
-            if map.element_relationship == ElementRelationship::Atomic {
-                // Atomic maps are leaves
-                if !path.is_empty() {
-                    set.insert(&path);
-                }
-            } else if let Value::Map(fields) = value {
-                for (key, val) in fields.iter() {
-                    let pe = PathElement::field_name(key.clone());
-                    let field_path = path.with(pe);
-
-                    let field_type = if let Some(field) = map.find_field(key) {
-                        field.field_type.clone()
+            Value::List(items) => {
+                if let Some(ref list) = atom.list {
+                    if list.element_relationship == ElementRelationship::Atomic {
+                        // Atomic lists are leaves
+                        if !path.is_empty() {
+                            set.insert(&path);
+                        }
                     } else {
-                        map.element_type.clone()
-                    };
-
-                    self.collect_field_set(val, &field_type, field_path, set, errors);
+                        for (i, item) in items.iter().enumerate() {
+                            let pe = if list.element_relationship == ElementRelationship::Associative {
+                                if list.keys.is_empty() {
+                                    // Set semantics - use the value as the path element
+                                    PathElement::value(item.clone())
+                                } else {
+                                    // Keyed associative list
+                                    match self.list_item_to_key(item, list) {
+                                        Ok(key) => PathElement::Key(key),
+                                        Err(_) => PathElement::index(i as i32),
+                                    }
+                                }
+                            } else {
+                                PathElement::index(i as i32)
+                            };
+                            let item_path = path.with(pe);
+                            self.collect_field_set(item, &list.element_type, item_path.clone(), set, errors);
+                            // For keyed associative lists, also insert the item path itself
+                            if list.element_relationship == ElementRelationship::Associative && !list.keys.is_empty() {
+                                set.insert(&item_path);
+                            }
+                        }
+                    }
+                } else if atom.scalar.is_some() {
+                    // Fallback to scalar treatment
+                    if !path.is_empty() {
+                        set.insert(&path);
+                    }
+                }
+            }
+            _ => {
+                // Scalar values (String, Int, Float, Bool, Null)
+                if atom.scalar.is_some() {
+                    if !path.is_empty() {
+                        set.insert(&path);
+                    }
                 }
             }
         }
@@ -412,23 +561,106 @@ impl TypedValue {
             None => return,
         };
 
-        // Handle scalar comparison
-        if let Some(_) = atom.scalar {
-            if lhs != rhs {
-                comparison.modified.insert(&path);
+        // Check value types first to handle "sum types" like deduced schema
+        match (lhs, rhs) {
+            (Value::Map(_), Value::Map(_)) => {
+                if let Some(ref map) = atom.map {
+                    self.compare_maps(lhs, rhs, map, path, comparison);
+                } else if lhs != rhs {
+                    comparison.modified.insert(&path);
+                }
             }
-            return;
-        }
+            (Value::List(_), Value::List(_)) => {
+                if let Some(ref list) = atom.list {
+                    self.compare_lists(lhs, rhs, list, path, comparison);
+                } else if lhs != rhs {
+                    comparison.modified.insert(&path);
+                }
+            }
+            _ => {
+                // Type mismatch or scalar comparison
+                if lhs != rhs {
+                    comparison.modified.insert(&path);
 
-        // Handle list comparison
-        if let Some(ref list) = atom.list {
-            self.compare_lists(lhs, rhs, list, path, comparison);
-            return;
+                    // For type changes, track nested paths as added/removed
+                    // If LHS is a map, all its nested paths are "removed"
+                    if let Value::Map(_) = lhs {
+                        if atom.map.is_some() {
+                            self.collect_all_paths(lhs, type_ref, path.clone(), &mut comparison.removed);
+                        }
+                    }
+                    // If RHS is a map, all its nested paths are "added"
+                    if let Value::Map(_) = rhs {
+                        if atom.map.is_some() {
+                            self.collect_all_paths(rhs, type_ref, path.clone(), &mut comparison.added);
+                        }
+                    }
+                }
+            }
         }
+    }
 
-        // Handle map comparison
-        if let Some(ref map) = atom.map {
-            self.compare_maps(lhs, rhs, map, path, comparison);
+    /// Collects all nested paths from a value into a set.
+    fn collect_all_paths(
+        &self,
+        value: &Value,
+        type_ref: &TypeRef,
+        path: Path,
+        set: &mut Set,
+    ) {
+        let atom = match self.schema.resolve(type_ref) {
+            Some(atom) => atom,
+            None => return,
+        };
+
+        match value {
+            Value::Map(fields) => {
+                if let Some(ref map) = atom.map {
+                    if map.element_relationship == ElementRelationship::Atomic {
+                        return; // Atomic maps are leaves, already tracked at parent
+                    }
+                    for (key, val) in fields.iter() {
+                        let pe = PathElement::field_name(key.clone());
+                        let field_path = path.with(pe);
+
+                        // Insert the field path
+                        set.insert(&field_path);
+
+                        let field_type = if let Some(field) = map.find_field(key) {
+                            field.field_type.clone()
+                        } else {
+                            map.element_type.clone()
+                        };
+
+                        self.collect_all_paths(val, &field_type, field_path, set);
+                    }
+                }
+            }
+            Value::List(items) => {
+                if let Some(ref list) = atom.list {
+                    if list.element_relationship == ElementRelationship::Atomic {
+                        return; // Atomic lists are leaves
+                    }
+                    for (i, item) in items.iter().enumerate() {
+                        let pe = if list.element_relationship == ElementRelationship::Associative {
+                            if list.keys.is_empty() {
+                                PathElement::value(item.clone())
+                            } else {
+                                match self.list_item_to_key(item, list) {
+                                    Ok(key) => PathElement::Key(key),
+                                    Err(_) => PathElement::index(i as i32),
+                                }
+                            }
+                        } else {
+                            PathElement::index(i as i32)
+                        };
+                        let item_path = path.with(pe);
+                        set.insert(&item_path);
+                        self.collect_all_paths(item, &list.element_type, item_path, set);
+                    }
+                }
+            }
+            _ => {} // Scalars don't have nested paths
         }
     }
 
@@ -464,22 +696,38 @@ impl TypedValue {
         let mut rhs_by_key = std::collections::HashMap::new();
 
         for (i, item) in lhs_items.iter().enumerate() {
-            let key = if list.element_relationship == ElementRelationship::Associative {
-                self.list_item_to_key(item, list).ok()
+            let pe = if list.element_relationship == ElementRelationship::Associative {
+                if list.keys.is_empty() {
+                    // Set semantics - use the value as the path element
+                    PathElement::value(item.clone())
+                } else {
+                    // Keyed associative list
+                    match self.list_item_to_key(item, list) {
+                        Ok(key) => PathElement::Key(key),
+                        Err(_) => PathElement::index(i as i32),
+                    }
+                }
             } else {
-                None
+                PathElement::index(i as i32)
             };
-            let pe = key.map(PathElement::Key).unwrap_or_else(|| PathElement::index(i as i32));
             lhs_by_key.insert(pe, item);
         }
 
         for (i, item) in rhs_items.iter().enumerate() {
-            let key = if list.element_relationship == ElementRelationship::Associative {
-                self.list_item_to_key(item, list).ok()
+            let pe = if list.element_relationship == ElementRelationship::Associative {
+                if list.keys.is_empty() {
+                    // Set semantics - use the value as the path element
+                    PathElement::value(item.clone())
+                } else {
+                    // Keyed associative list
+                    match self.list_item_to_key(item, list) {
+                        Ok(key) => PathElement::Key(key),
+                        Err(_) => PathElement::index(i as i32),
+                    }
+                }
             } else {
-                None
+                PathElement::index(i as i32)
             };
-            let pe = key.map(PathElement::Key).unwrap_or_else(|| PathElement::index(i as i32));
             rhs_by_key.insert(pe, item);
         }
 
@@ -520,14 +768,39 @@ impl TypedValue {
             return;
         }
 
+        // Handle null vs non-null as modification
+        let lhs_is_null = matches!(lhs, Value::Null);
+        let rhs_is_null = matches!(rhs, Value::Null);
+
+        if lhs_is_null != rhs_is_null {
+            // One is null and the other is not - this is a modification
+            comparison.modified.insert(&path);
+        }
+
         let lhs_fields = match lhs {
             Value::Map(m) => m,
-            Value::Null => return,
+            Value::Null => {
+                // rhs must be a map, so all its fields are added
+                if let Value::Map(rhs_map) = rhs {
+                    for (key, _) in rhs_map.iter() {
+                        let pe = PathElement::field_name(key.clone());
+                        comparison.added.insert(&path.with(pe));
+                    }
+                }
+                return;
+            },
             _ => return,
         };
         let rhs_fields = match rhs {
             Value::Map(m) => m,
-            Value::Null => return,
+            Value::Null => {
+                // lhs must be a map, so all its fields are removed
+                for (key, _) in lhs_fields.iter() {
+                    let pe = PathElement::field_name(key.clone());
+                    comparison.removed.insert(&path.with(pe));
+                }
+                return;
+            },
             _ => return,
         };
 
@@ -544,16 +817,19 @@ impl TypedValue {
             let pe = PathElement::field_name(key.clone());
             let field_path = path.with(pe);
 
+            let field_type = if let Some(field) = map.find_field(key) {
+                field.field_type.clone()
+            } else {
+                map.element_type.clone()
+            };
+
             match lhs_fields.get(key) {
                 None => {
                     comparison.added.insert(&field_path);
+                    // Recursively collect all nested paths from the added field
+                    self.collect_all_paths(rhs_val, &field_type, field_path, &mut comparison.added);
                 }
                 Some(lhs_val) => {
-                    let field_type = if let Some(field) = map.find_field(key) {
-                        field.field_type.clone()
-                    } else {
-                        map.element_type.clone()
-                    };
                     self.compare_values(lhs_val, rhs_val, &field_type, field_path, comparison);
                 }
             }
@@ -587,51 +863,67 @@ impl TypedValue {
             None => return value.clone(),
         };
 
-        // Scalars don't have children to remove
-        if atom.scalar.is_some() {
-            return value.clone();
-        }
+        // Check value type first to handle "sum types" like deduced schema
+        // where atom has both scalar and map defined
+        match value {
+            // Handle lists
+            Value::List(values) => {
+                if let Some(ref list) = atom.list {
+                    let mut new_values = Vec::new();
+                    for (i, item) in values.iter().enumerate() {
+                        let pe = if list.element_relationship == ElementRelationship::Associative {
+                            if list.keys.is_empty() {
+                                // Set semantics - use the value as the path element
+                                PathElement::value(item.clone())
+                            } else {
+                                match self.list_item_to_key(item, list) {
+                                    Ok(key) => PathElement::Key(key),
+                                    Err(_) => PathElement::index(i as i32),
+                                }
+                            }
+                        } else {
+                            PathElement::index(i as i32)
+                        };
+                        let item_path = path.with(pe);
 
-        // Handle lists
-        if let (Some(ref list), Value::List(values)) = (&atom.list, value) {
-            let mut new_values = Vec::new();
-            for (i, item) in values.iter().enumerate() {
-                let pe = if list.element_relationship == ElementRelationship::Associative {
-                    match self.list_item_to_key(item, list) {
-                        Ok(key) => PathElement::Key(key),
-                        Err(_) => PathElement::index(i as i32),
+                        if !items.has(&item_path) {
+                            let new_item = self.remove_items_from_value(item, &list.element_type, items, item_path);
+                            new_values.push(new_item);
+                        }
                     }
-                } else {
-                    PathElement::index(i as i32)
-                };
-                let item_path = path.with(pe);
-
-                if !items.has(&item_path) {
-                    let new_item = self.remove_items_from_value(item, &list.element_type, items, item_path);
-                    new_values.push(new_item);
+                    return Value::List(new_values);
                 }
             }
-            return Value::List(new_values);
-        }
 
-        // Handle maps
-        if let (Some(ref map), Value::Map(fields)) = (&atom.map, value) {
-            let mut new_map = crate::value::Map::new();
-            for (key, val) in fields.iter() {
-                let pe = PathElement::field_name(key.clone());
-                let field_path = path.with(pe);
+            // Handle maps
+            Value::Map(fields) => {
+                if let Some(ref map) = atom.map {
+                    let mut new_map = crate::value::Map::new();
+                    for (key, val) in fields.iter() {
+                        let pe = PathElement::field_name(key.clone());
+                        let field_path = path.with(pe);
 
-                if !items.has(&field_path) {
-                    let field_type = if let Some(field) = map.find_field(key) {
-                        field.field_type.clone()
-                    } else {
-                        map.element_type.clone()
-                    };
-                    let new_val = self.remove_items_from_value(val, &field_type, items, field_path);
-                    new_map.set(key.clone(), new_val);
+                        if !items.has(&field_path) {
+                            let field_type = if let Some(field) = map.find_field(key) {
+                                field.field_type.clone()
+                            } else {
+                                map.element_type.clone()
+                            };
+                            let new_val = self.remove_items_from_value(val, &field_type, items, field_path);
+                            // Keep the field even if value is null (field wasn't explicitly removed)
+                            new_map.set(key.clone(), new_val);
+                        }
+                    }
+                    // Return null if the map is now empty (all fields were explicitly removed)
+                    if new_map.is_empty() {
+                        return Value::Null;
+                    }
+                    return Value::Map(new_map);
                 }
             }
-            return Value::Map(new_map);
+
+            // Scalars and other values - nothing to remove
+            _ => {}
         }
 
         value.clone()
@@ -674,9 +966,14 @@ impl TypedValue {
             let mut new_values = Vec::new();
             for (i, item) in values.iter().enumerate() {
                 let pe = if list.element_relationship == ElementRelationship::Associative {
-                    match self.list_item_to_key(item, list) {
-                        Ok(key) => PathElement::Key(key),
-                        Err(_) => PathElement::index(i as i32),
+                    if list.keys.is_empty() {
+                        // Set semantics - use the value as the path element
+                        PathElement::value(item.clone())
+                    } else {
+                        match self.list_item_to_key(item, list) {
+                            Ok(key) => PathElement::Key(key),
+                            Err(_) => PathElement::index(i as i32),
+                        }
                     }
                 } else {
                     PathElement::index(i as i32)
@@ -742,9 +1039,9 @@ impl TypedValue {
     }
 
     fn merge_values(&self, lhs: &Value, rhs: &Value, type_ref: &TypeRef) -> Value {
-        // If rhs is null, keep lhs
+        // If rhs is null, it means "delete/clear" - use null
         if matches!(rhs, Value::Null) {
-            return lhs.clone();
+            return Value::Null;
         }
 
         // If lhs is null, use rhs
@@ -757,77 +1054,107 @@ impl TypedValue {
             None => return rhs.clone(),
         };
 
-        // Scalars - keep rhs
-        if atom.scalar.is_some() {
-            return rhs.clone();
+        // Check value types first to handle "sum types" like deduced schema
+        match (lhs, rhs) {
+            (Value::Map(lhs_fields), Value::Map(rhs_fields)) => {
+                if let Some(ref map) = atom.map {
+                    if map.element_relationship == ElementRelationship::Atomic {
+                        return rhs.clone();
+                    }
+                    return self.merge_maps(lhs_fields, rhs_fields, map);
+                }
+                // No map schema - replace with rhs
+                rhs.clone()
+            }
+            (Value::List(lhs_items), Value::List(rhs_items)) => {
+                if let Some(ref list) = atom.list {
+                    if list.element_relationship == ElementRelationship::Atomic {
+                        return rhs.clone();
+                    }
+                    return self.merge_lists(lhs_items, rhs_items, list);
+                }
+                // No list schema - replace with rhs
+                rhs.clone()
+            }
+            _ => {
+                // Scalar or type mismatch - RHS replaces LHS
+                rhs.clone()
+            }
         }
-
-        // Atomic lists and maps - replace entirely
-        if let Some(ref list) = atom.list {
-            if list.element_relationship == ElementRelationship::Atomic {
-                return rhs.clone();
-            }
-
-            // Non-atomic lists - merge by key (for associative) or by index
-            if let (Value::List(lhs_items), Value::List(rhs_items)) = (lhs, rhs) {
-                return self.merge_lists(lhs_items, rhs_items, list);
-            }
-            return rhs.clone();
-        }
-
-        if let Some(ref map) = atom.map {
-            if map.element_relationship == ElementRelationship::Atomic {
-                return rhs.clone();
-            }
-
-            // Non-atomic maps - merge fields recursively
-            if let (Value::Map(lhs_fields), Value::Map(rhs_fields)) = (lhs, rhs) {
-                return self.merge_maps(lhs_fields, rhs_fields, map);
-            }
-            return rhs.clone();
-        }
-
-        rhs.clone()
     }
 
     fn merge_lists(&self, lhs: &[Value], rhs: &[Value], list: &crate::schema::List) -> Value {
         if list.element_relationship == ElementRelationship::Associative {
-            // Build index by key
-            let mut merged: std::collections::HashMap<FieldList, Value> = std::collections::HashMap::new();
-            let mut order: Vec<FieldList> = Vec::new();
+            // Collect keys from both sides
+            let mut rhs_key_set: std::collections::HashSet<FieldList> = std::collections::HashSet::new();
+            let mut lhs_key_set: std::collections::HashSet<FieldList> = std::collections::HashSet::new();
 
-            // Add lhs items
+            // For handling duplicates: map from key to list of values in LHS
+            let mut lhs_by_key: std::collections::HashMap<FieldList, Vec<Value>> = std::collections::HashMap::new();
+
             for item in lhs {
                 if let Ok(key) = self.list_item_to_key(item, list) {
-                    if !merged.contains_key(&key) {
-                        order.push(key.clone());
-                    }
-                    merged.insert(key, item.clone());
+                    lhs_key_set.insert(key.clone());
+                    lhs_by_key.entry(key).or_insert_with(Vec::new).push(item.clone());
                 }
             }
 
-            // Merge rhs items (replaces or adds)
             for item in rhs {
                 if let Ok(key) = self.list_item_to_key(item, list) {
-                    if let Some(lhs_item) = merged.get(&key) {
-                        // Merge the items recursively
-                        let merged_item = self.merge_values(lhs_item, item, &list.element_type);
-                        if !merged.contains_key(&key) {
-                            order.push(key.clone());
-                        }
-                        merged.insert(key, merged_item);
-                    } else {
-                        order.push(key.clone());
-                        merged.insert(key, item.clone());
-                    }
+                    rhs_key_set.insert(key.clone());
                 }
             }
 
-            // Reconstruct list in order
-            let result: Vec<Value> = order.into_iter()
-                .filter_map(|k| merged.remove(&k))
-                .collect();
-            Value::List(result)
+            // Check if this is a "pure set" (empty keys) or keyed list
+            let is_set = list.keys.is_empty();
+
+            // For sets: if RHS is a PROPER subset of LHS and LHS has no duplicates that RHS touches,
+            // preserve LHS order. But if sets are equal, use RHS order.
+            let rhs_subset_of_lhs = rhs_key_set.iter().all(|k| lhs_key_set.contains(k));
+            let lhs_subset_of_rhs = lhs_key_set.iter().all(|k| rhs_key_set.contains(k));
+            let lhs_has_rhs_duplicates = rhs_key_set.iter().any(|k| {
+                lhs_by_key.get(k).map_or(false, |v| v.len() > 1)
+            });
+            let rhs_is_proper_subset = rhs_subset_of_lhs && !lhs_subset_of_rhs;
+
+            if is_set && rhs_is_proper_subset && !lhs_has_rhs_duplicates {
+                // For sets: RHS ⊆ LHS with no duplicates to resolve - preserve LHS
+                Value::List(lhs.to_vec())
+            } else {
+                // General case: items only in LHS first, then RHS items in RHS order
+                let mut result: Vec<Value> = Vec::new();
+
+                // Add LHS items that are NOT in RHS (preserving order and duplicates)
+                for item in lhs {
+                    if let Ok(key) = self.list_item_to_key(item, list) {
+                        if !rhs_key_set.contains(&key) {
+                            result.push(item.clone());
+                        }
+                    }
+                }
+
+                // Add RHS items in RHS order
+                // For keyed lists: merge with first LHS item if present
+                // For sets: just use RHS item (deduplicates by only adding once)
+                for item in rhs {
+                    if let Ok(key) = self.list_item_to_key(item, list) {
+                        // For keyed lists with actual keys, merge with LHS
+                        if !is_set {
+                            if let Some(lhs_items) = lhs_by_key.get(&key) {
+                                if let Some(first_lhs) = lhs_items.first() {
+                                    let merged = self.merge_values(first_lhs, item, &list.element_type);
+                                    result.push(merged);
+                                    continue;
+                                }
+                            }
+                        }
+                        // For sets or new items, just add
+                        result.push(item.clone());
+                    }
+                }
+
+                Value::List(result)
+            }
         } else {
             // Non-associative lists - just use rhs entirely
             Value::List(rhs.to_vec())
