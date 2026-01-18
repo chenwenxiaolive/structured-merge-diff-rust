@@ -358,12 +358,191 @@ This implementation is compatible with Go structured-merge-diff v6.3.0. All test
 | set_test.go | 10 |
 | **Total** | **285 tests** |
 
+## CLI Tool
+
+The `smd` command-line tool provides structured operations on YAML/JSON files.
+
+### Installation
+
+```bash
+cargo install --path .
+```
+
+### Commands
+
+```bash
+# List all types in a schema
+smd -s schema.yaml list-types
+
+# Validate a file against a schema
+smd -s schema.yaml validate pod.yaml
+
+# Merge two files
+smd -s schema.yaml merge --lhs base.yaml --rhs overlay.yaml
+
+# Compare two files
+smd -s schema.yaml compare --lhs old.yaml --rhs new.yaml
+
+# Build a fieldset from a file
+smd -s schema.yaml fieldset pod.yaml
+```
+
+### Options
+
+- `-s, --schema <FILE>`: Path to the schema file (required)
+- `-t, --type-name <NAME>`: Type name to use (defaults to first type in schema)
+- `-o, --output <FILE>`: Output file (defaults to stdout)
+
+### Example
+
+```bash
+# Create a schema file
+cat > schema.yaml << 'EOF'
+types:
+- name: Pod
+  map:
+    fields:
+    - name: metadata
+      type:
+        namedType: ObjectMeta
+    - name: spec
+      type:
+        namedType: PodSpec
+- name: ObjectMeta
+  map:
+    fields:
+    - name: name
+      type:
+        scalar: string
+    - name: labels
+      type:
+        map:
+          elementType:
+            scalar: string
+- name: PodSpec
+  map:
+    fields:
+    - name: containers
+      type:
+        list:
+          elementType:
+            namedType: Container
+          elementRelationship: associative
+          keys:
+          - name
+- name: Container
+  map:
+    fields:
+    - name: name
+      type:
+        scalar: string
+    - name: image
+      type:
+        scalar: string
+EOF
+
+# Create pod files
+cat > pod1.yaml << 'EOF'
+metadata:
+  name: my-pod
+  labels:
+    app: test
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.0
+EOF
+
+cat > pod2.yaml << 'EOF'
+metadata:
+  name: my-pod
+  labels:
+    version: v1
+spec:
+  containers:
+  - name: nginx
+    image: nginx:2.0
+  - name: sidecar
+    image: sidecar:1.0
+EOF
+
+# Compare the two pods
+smd -s schema.yaml compare --lhs pod1.yaml --rhs pod2.yaml
+
+# Merge the two pods
+smd -s schema.yaml merge --lhs pod1.yaml --rhs pod2.yaml
+```
+
+## Go vs Rust Implementation Comparison
+
+This Rust implementation is a complete port of the Go [structured-merge-diff](https://github.com/kubernetes-sigs/structured-merge-diff) v6.3.0.
+
+### Module Mapping
+
+| Go Module | Rust Module | Status |
+|-----------|-------------|--------|
+| `fieldpath/` | `fieldpath/` | ✅ Complete |
+| `merge/` | `merge/` | ✅ Complete |
+| `schema/` | `schema/` | ✅ Complete |
+| `typed/` | `typed/` | ✅ Complete |
+| `value/` | `value/` | ✅ Complete (uses serde instead of reflect) |
+| `smd/` | `bin/smd.rs` | ✅ Complete |
+| - | `openapi/` | ✅ New (OpenAPI v2/v3 converter) |
+
+### File Mapping
+
+#### fieldpath
+| Go | Rust |
+|----|------|
+| element.go | mod.rs (PathElement) |
+| path.go | path.rs |
+| pathelementmap.go | pathelementmap.rs |
+| serialize.go, serialize-pe.go | serialize.rs |
+| set.go | set.rs |
+| fromvalue.go | typed_value.rs (to_field_set) |
+| managers.go | set.rs (ManagedFields) |
+
+#### merge
+| Go | Rust |
+|----|------|
+| conflict.go | conflict.rs |
+| update.go | updater.rs |
+
+#### schema
+| Go | Rust |
+|----|------|
+| elements.go | elements.rs |
+| equals.go | equals.rs |
+| schemaschema.go | schemaschema.rs |
+
+#### typed
+| Go | Rust |
+|----|------|
+| typed.go | typed_value.rs |
+| parser.go | parser.rs |
+| validate.go | validation.rs |
+| compare.go | comparison.rs |
+| merge.go, remove.go, tofieldset.go | typed_value.rs |
+| reconcile_schema.go | reconcile_schema.rs |
+| helpers.go | typed_value.rs |
+
+#### value
+| Go | Rust |
+|----|------|
+| value.go, scalar.go | value.rs |
+| map.go, list.go, fields.go | value.rs (via serde) |
+| *reflect*.go, *unstructured*.go | N/A (Rust uses serde) |
+| allocator.go | N/A (Rust has automatic memory management) |
+
 ## Development
 
 ### Building
 
 ```bash
 cargo build
+
+# Build CLI tool
+cargo build --release
 ```
 
 ### Testing
