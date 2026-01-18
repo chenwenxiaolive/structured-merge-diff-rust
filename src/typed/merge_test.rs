@@ -432,13 +432,6 @@ mod tests {
                     rhs: r#"{"list":[{"key":"a","id":2,"value":{"a":"a"}}]}"#,
                     out: r#"{"list":[{"key":"a","id":1,"value":{"a":"a"}},{"key":"a","id":2,"value":{"a":"a"}}]}"#,
                 },
-                // TODO: This test requires complex position-based interleaving for keyed lists
-                // Multiple items with partial overlap - commented out until properly implemented
-                // MergeTriplet {
-                //     lhs: r#"{"list":[{"key":"a","id":1},{"key":"b","id":1}]}"#,
-                //     rhs: r#"{"list":[{"key":"a","id":1},{"key":"a","id":2}]}"#,
-                //     out: r#"{"list":[{"key":"a","id":1},{"key":"b","id":1},{"key":"a","id":2}]}"#,
-                // },
                 // Atomic list - replace
                 MergeTriplet {
                     lhs: r#"{"atomicList":["a","a","a"]}"#,
