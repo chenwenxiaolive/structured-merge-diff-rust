@@ -487,7 +487,17 @@ This Rust implementation is a complete port of the Go [structured-merge-diff](ht
 | `typed/` | `typed/` | ✅ Complete |
 | `value/` | `value/` | ✅ Complete (uses serde instead of reflect) |
 | `smd/` | `bin/smd.rs` | ✅ Complete |
+| `internal/fixture/` | - | ⏭️ Test framework only (not part of public API) |
+| `internal/cli/` | `bin/smd.rs` | ✅ Integrated into CLI |
 | - | `openapi/` | ✅ New (OpenAPI v2/v3 converter) |
+
+### Notes on Go `internal/` Directory
+
+The Go `internal/` directory contains:
+
+- **`internal/fixture/`**: Test helper framework (`State`, `TestCase`, `Operation` types) used for table-driven tests. This is not part of the library's public API. Rust tests use the core API directly, and all 285 tests pass.
+
+- **`internal/cli/`**: CLI option parsing and operation implementations. These are fully integrated into `src/bin/smd.rs` using the `clap` crate.
 
 ### File Mapping
 
