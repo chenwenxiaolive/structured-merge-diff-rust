@@ -2,7 +2,7 @@
 //!
 //! A command line tool for performing structured operations on YAML/JSON files.
 
-use clap::{Args, Parser, Subcommand};
+use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -11,64 +11,217 @@ use std::process::ExitCode;
 use structured_merge_diff::typed::Parser as SchemaParser;
 use structured_merge_diff::value;
 
-#[derive(Parser)]
-#[command(name = "smd")]
-#[command(about = "Structured Merge Diff - CLI tool for structured operations on YAML/JSON files")]
-#[command(version)]
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn print_help() {
+    eprintln!(
+        r#"smd {} - Structured Merge Diff CLI tool
+
+USAGE:
+    smd [OPTIONS] <COMMAND>
+
+OPTIONS:
+    -s, --schema <FILE>      Path to the schema file (required)
+    -t, --type-name <NAME>   Name of type in the schema to use
+    -o, --output <FILE>      Output location. Use '-' for stdout (default: -)
+    -h, --help               Print help information
+    -V, --version            Print version information
+
+COMMANDS:
+    list-types               List all types in the schema
+    validate <FILE>          Validate a YAML/JSON file against the schema
+    merge --lhs <FILE> --rhs <FILE>
+                             Merge two YAML/JSON files
+    compare --lhs <FILE> --rhs <FILE>
+                             Compare two YAML/JSON files
+    fieldset <FILE>          Build a fieldset from a YAML/JSON file
+"#,
+        VERSION
+    );
+}
+
+fn print_version() {
+    println!("smd {}", VERSION);
+}
+
+#[derive(Debug)]
 struct Cli {
-    /// Path to the schema file
-    #[arg(short, long)]
     schema: PathBuf,
-
-    /// Name of type in the schema to use. If empty, the first type will be used.
-    #[arg(short = 't', long)]
     type_name: Option<String>,
-
-    /// Output location. Use '-' for stdout.
-    #[arg(short, long, default_value = "-")]
     output: String,
-
-    #[command(subcommand)]
-    command: Commands,
+    command: Command,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// List all types in the schema
+#[derive(Debug)]
+enum Command {
     ListTypes,
-
-    /// Validate a YAML/JSON file against the schema
-    Validate {
-        /// Path to the file to validate
-        file: PathBuf,
-    },
-
-    /// Merge two YAML/JSON files
-    Merge(TwoFileArgs),
-
-    /// Compare two YAML/JSON files
-    Compare(TwoFileArgs),
-
-    /// Build a fieldset from a YAML/JSON file
-    Fieldset {
-        /// Path to the file
-        file: PathBuf,
-    },
+    Validate { file: PathBuf },
+    Merge { lhs: PathBuf, rhs: PathBuf },
+    Compare { lhs: PathBuf, rhs: PathBuf },
+    Fieldset { file: PathBuf },
 }
 
-#[derive(Args)]
-struct TwoFileArgs {
-    /// Path to the left-hand side file
-    #[arg(long)]
-    lhs: PathBuf,
+fn parse_args() -> Result<Cli, String> {
+    let args: Vec<String> = env::args().collect();
+    let mut i = 1;
 
-    /// Path to the right-hand side file
-    #[arg(long)]
-    rhs: PathBuf,
+    let mut schema: Option<PathBuf> = None;
+    let mut type_name: Option<String> = None;
+    let mut output = "-".to_string();
+    let mut command: Option<Command> = None;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
+            "-s" | "--schema" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value for --schema".to_string());
+                }
+                schema = Some(PathBuf::from(&args[i]));
+            }
+            "-t" | "--type-name" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value for --type-name".to_string());
+                }
+                type_name = Some(args[i].clone());
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value for --output".to_string());
+                }
+                output = args[i].clone();
+            }
+            "list-types" => {
+                command = Some(Command::ListTypes);
+            }
+            "validate" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing file argument for validate".to_string());
+                }
+                command = Some(Command::Validate {
+                    file: PathBuf::from(&args[i]),
+                });
+            }
+            "merge" => {
+                let mut lhs: Option<PathBuf> = None;
+                let mut rhs: Option<PathBuf> = None;
+                i += 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--lhs" => {
+                            i += 1;
+                            if i >= args.len() {
+                                return Err("Missing value for --lhs".to_string());
+                            }
+                            lhs = Some(PathBuf::from(&args[i]));
+                        }
+                        "--rhs" => {
+                            i += 1;
+                            if i >= args.len() {
+                                return Err("Missing value for --rhs".to_string());
+                            }
+                            rhs = Some(PathBuf::from(&args[i]));
+                        }
+                        _ => {
+                            i -= 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                match (lhs, rhs) {
+                    (Some(l), Some(r)) => {
+                        command = Some(Command::Merge { lhs: l, rhs: r });
+                    }
+                    _ => {
+                        return Err("merge requires --lhs and --rhs arguments".to_string());
+                    }
+                }
+            }
+            "compare" => {
+                let mut lhs: Option<PathBuf> = None;
+                let mut rhs: Option<PathBuf> = None;
+                i += 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--lhs" => {
+                            i += 1;
+                            if i >= args.len() {
+                                return Err("Missing value for --lhs".to_string());
+                            }
+                            lhs = Some(PathBuf::from(&args[i]));
+                        }
+                        "--rhs" => {
+                            i += 1;
+                            if i >= args.len() {
+                                return Err("Missing value for --rhs".to_string());
+                            }
+                            rhs = Some(PathBuf::from(&args[i]));
+                        }
+                        _ => {
+                            i -= 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                match (lhs, rhs) {
+                    (Some(l), Some(r)) => {
+                        command = Some(Command::Compare { lhs: l, rhs: r });
+                    }
+                    _ => {
+                        return Err("compare requires --lhs and --rhs arguments".to_string());
+                    }
+                }
+            }
+            "fieldset" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing file argument for fieldset".to_string());
+                }
+                command = Some(Command::Fieldset {
+                    file: PathBuf::from(&args[i]),
+                });
+            }
+            arg => {
+                return Err(format!("Unknown argument: {}", arg));
+            }
+        }
+        i += 1;
+    }
+
+    let schema = schema.ok_or_else(|| "Missing required --schema argument".to_string())?;
+    let command = command.ok_or_else(|| "Missing command".to_string())?;
+
+    Ok(Cli {
+        schema,
+        type_name,
+        output,
+        command,
+    })
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match parse_args() {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            eprintln!();
+            print_help();
+            return ExitCode::FAILURE;
+        }
+    };
 
     if let Err(e) = run(cli) {
         eprintln!("Error: {}", e);
@@ -105,19 +258,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute command
     match cli.command {
-        Commands::ListTypes => {
+        Command::ListTypes => {
             list_types(&parser, &mut output)?;
         }
-        Commands::Validate { file } => {
+        Command::Validate { file } => {
             validate(&parser, &type_name, &file, &mut output)?;
         }
-        Commands::Merge(args) => {
-            merge(&parser, &type_name, &args.lhs, &args.rhs, &mut output)?;
+        Command::Merge { lhs, rhs } => {
+            merge(&parser, &type_name, &lhs, &rhs, &mut output)?;
         }
-        Commands::Compare(args) => {
-            compare(&parser, &type_name, &args.lhs, &args.rhs, &mut output)?;
+        Command::Compare { lhs, rhs } => {
+            compare(&parser, &type_name, &lhs, &rhs, &mut output)?;
         }
-        Commands::Fieldset { file } => {
+        Command::Fieldset { file } => {
             fieldset(&parser, &type_name, &file, &mut output)?;
         }
     }
