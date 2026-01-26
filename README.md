@@ -589,3 +589,7 @@ This project is based on the original Go implementation by the Kubernetes SIGs t
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
+
+## Security
+
+If you discover a security vulnerability, please report it via GitHub Security Advisories.
