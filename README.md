@@ -577,3 +577,7 @@ cargo clippy
 ## License
 
 Apache-2.0, matching the original Go implementation.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
