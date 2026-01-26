@@ -593,3 +593,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 ## Security
 
 If you discover a security vulnerability, please report it via GitHub Security Advisories.
+
+## Support
+
+For questions and discussions, please open an issue on GitHub.
