@@ -585,3 +585,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Acknowledgements
 
 This project is based on the original Go implementation by the Kubernetes SIGs team.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
